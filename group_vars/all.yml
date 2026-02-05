@@ -1,0 +1,11 @@
+# group_vars/all.yml
+---
+# Choose Kubernetes minor version train that exists in pkgs.k8s.io
+kubernetes_minor: "v1.29"
+# Pod network CIDR (Calico default)
+pod_network_cidr: "192.168.0.0/16"
+# Container runtime
+docker_runtime: false
+use_containerd: true
+# Set containerd to use systemd cgroups
+containerd_systemd_cgroup: true

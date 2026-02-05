@@ -1,0 +1,227 @@
+# site.yml — One-command cluster bring-up with kubeadm + containerd + Calico
+# Run with: ansible-playbook -i inventory/hosts.ini site.yml -b
+
+- name: Prepare OS on all nodes
+  hosts: k8s_cluster
+  become: true
+  tasks:
+    - name: Ensure apt prerequisites present (Ubuntu)
+      apt:
+        name: ["apt-transport-https", "ca-certificates", "curl", "gnupg", "lsb-release"]
+        state: present
+        update_cache: yes
+
+    - name: Disable swap immediately
+      command: swapoff -a
+      when: ansible_swaptotal_mb | int > 0
+
+    - name: Disable swap permanently in fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\\sswap\\s.*)$'
+        replace: '# \\1'
+
+    - name: Configure kernel modules persistence
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Load required kernel modules now
+      shell: |
+        modprobe overlay
+        modprobe br_netfilter
+      args:
+        warn: false
+
+    - name: Configure sysctl params for Kubernetes
+      copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+
+    - name: Apply sysctl params
+      command: sysctl --system
+
+- name: Install and configure containerd on all nodes
+  hosts: k8s_cluster
+  become: true
+  vars:
+    containerd_config: /etc/containerd/config.toml
+  tasks:
+    - name: Install containerd
+      apt:
+        name: containerd
+        state: present
+        update_cache: yes
+
+    - name: Create default containerd configuration if missing
+      shell: |
+        test -f {{ containerd_config }} || (mkdir -p /etc/containerd && containerd config default > {{ containerd_config }})
+      args:
+        creates: "{{ containerd_config }}"
+
+    - name: Ensure SystemdCgroup is enabled in containerd
+      replace:
+        path: "{{ containerd_config }}"
+        regexp: '^\\s*SystemdCgroup = false'
+        replace: '    SystemdCgroup = true'
+
+    - name: Restart and enable containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: true
+
+- name: Install Kubernetes packages on all nodes
+  hosts: k8s_cluster
+  become: true
+  vars:
+    k8s_keyring: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  tasks:
+    - name: Ensure keyrings directory exists
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Kubernetes apt repo key
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/{{ kubernetes_minor }}/deb/Release.key | \
+          gpg --dearmor -o {{ k8s_keyring }}
+      args:
+        creates: "{{ k8s_keyring }}"
+
+    - name: Add Kubernetes apt repository
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: |
+          deb [signed-by={{ k8s_keyring }}] https://pkgs.k8s.io/core:/stable:/{{ kubernetes_minor }}/deb/ /
+
+    - name: Install kubelet, kubeadm, kubectl
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: Hold Kubernetes packages
+      shell: apt-mark hold kubelet kubeadm kubectl
+      changed_when: false
+
+    - name: Enable kubelet service (will remain inactive until kubeadm init/join)
+      systemd:
+        name: kubelet
+        enabled: true
+
+- name: Initialize control plane
+  hosts: kube_control_plane
+  become: true
+  vars:
+    kubeadm_init_args: "--pod-network-cidr={{ pod_network_cidr }}"
+  tasks:
+    - name: Check if cluster is already initialized
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: k8s_adminconf
+
+    - name: kubeadm init
+      command: kubeadm init {{ kubeadm_init_args }}
+      when: not k8s_adminconf.stat.exists
+      register: kubeadm_init_out
+      changed_when: "kubeadm_init_out.rc == 0"
+
+    - name: Export kubeconfig to root (admin.conf)
+      file:
+        path: /root/.kube
+        state: directory
+        mode: '0700'
+    
+    - name: Copy kubeconfig to root
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: true
+        mode: '0600'
+
+    - name: Copy kubeconfig to Ansible SSH user for convenience
+      become_user: "{{ ansible_user_id }}"
+      shell: |
+        mkdir -p $HOME/.kube
+        sudo cp -f /etc/kubernetes/admin.conf $HOME/.kube/config
+        sudo chown $(id -u):$(id -g) $HOME/.kube/config
+      args:
+        executable: /bin/bash
+
+    - name: Create (or refresh) join command token
+      shell: kubeadm token create --print-join-command
+      register: join_cmd
+
+    - name: Set join command fact on control host
+      set_fact:
+        kube_join_cmd: "{{ join_cmd.stdout }}"
+
+- name: Install CNI (Calico) on control plane
+  hosts: kube_control_plane
+  become: true
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  tasks:
+    - name: Apply Calico manifest
+      shell: |
+        kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml
+      args:
+        creates: /var/lib/cni/.calico_applied
+      register: calico_apply
+      changed_when: "'created' in calico_apply.stdout or 'configured' in calico_apply.stdout"
+
+    - name: Mark Calico applied (idempotence marker)
+      file:
+        path: /var/lib/cni/.calico_applied
+        state: touch
+
+- name: Join worker nodes to the cluster
+  hosts: kube_workers
+  become: true
+  vars:
+    control_host: "{{ groups['kube_control_plane'][0] }}"
+  tasks:
+    - name: Wait for control-plane join command fact
+      wait_for:
+        timeout: 5
+      when: hostvars[control_host].kube_join_cmd is defined
+
+    - name: Join the node to the cluster
+      command: "{{ hostvars[control_host].kube_join_cmd }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+
+- name: Verify cluster from control-plane
+  hosts: kube_control_plane
+  become: true
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  tasks:
+    - name: Wait for nodes to become Ready
+      shell: |
+        set -e
+        for i in {1..30}; do
+          NOT_READY=$(kubectl get nodes --no-headers | awk '$2!="Ready" {print $1}' | wc -l)
+          if [ "$NOT_READY" -eq 0 ]; then exit 0; fi
+          sleep 10
+        done
+        kubectl get nodes
+        exit 1
+
+    - name: Show nodes
+      command: kubectl get nodes -o wide
+      register: nodes_out
+
+    - name: Display nodes
+      debug:
+        var: nodes_out.stdout
