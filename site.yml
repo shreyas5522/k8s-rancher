@@ -27,13 +27,14 @@
         content: |
           overlay
           br_netfilter
-
     - name: Load required kernel modules now
-      shell: |
-        modprobe overlay
-        modprobe br_netfilter
-      args:
-        warn: false
+      ansible.builtin.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+      become: true
 
     - name: Configure sysctl params for Kubernetes
       copy:
