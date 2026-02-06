@@ -210,7 +210,8 @@
         mode: '0644'
 
     - name: Check if IP_AUTODETECTION_METHOD is commented in manifest
-      ansible.builtin.shell: grep -n "# - name: IP_AUTODETECTION_METHOD" {{ calico_manifest }} || true
+      ansible.builtin.shell: |
+        grep -n "# - name: IP_AUTODETECTION_METHOD" "{{ calico_manifest }}" || true
       register: ip_autodetect_check
       changed_when: false
 
@@ -229,7 +230,7 @@
       when: ip_autodetect_check.stdout != ""
 
     - name: Apply Calico manifest
-      ansible.builtin.command: kubectl apply -f {{ calico_manifest }}
+      ansible.builtin.command: kubectl apply -f "{{ calico_manifest }}"
       register: calico_apply
       changed_when: "'created' in calico_apply.stdout or 'configured' in calico_apply.stdout"
 
