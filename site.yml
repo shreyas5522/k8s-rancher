@@ -198,13 +198,38 @@
   environment:
     KUBECONFIG: /etc/kubernetes/admin.conf
   vars:
+    calico_manifest: /tmp/calico.yaml
     calico_marker: /etc/kubernetes/.calico_applied
+    # Auto-detect interface - can be overridden in group_vars
+    calico_ip_autodetect_method: "interface={{ ansible_default_ipv4.interface }}"
   tasks:
-    - name: Apply Calico manifest (idempotent via marker)
-      ansible.builtin.shell: |
-        kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml
-      args:
-        creates: "{{ calico_marker }}"
+    - name: Download Calico manifest
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml
+        dest: "{{ calico_manifest }}"
+        mode: '0644'
+
+    - name: Check if IP_AUTODETECTION_METHOD is commented in manifest
+      ansible.builtin.shell: grep -n "# - name: IP_AUTODETECTION_METHOD" {{ calico_manifest }} || true
+      register: ip_autodetect_check
+      changed_when: false
+
+    - name: Uncomment IP_AUTODETECTION_METHOD in Calico manifest
+      ansible.builtin.replace:
+        path: "{{ calico_manifest }}"
+        regexp: '(\s+)# - name: IP_AUTODETECTION_METHOD'
+        replace: '\1- name: IP_AUTODETECTION_METHOD'
+      when: ip_autodetect_check.stdout != ""
+
+    - name: Set IP_AUTODETECTION_METHOD value in Calico manifest
+      ansible.builtin.replace:
+        path: "{{ calico_manifest }}"
+        regexp: '(\s+)#   value: "interface=.*"'
+        replace: '\1  value: "{{ calico_ip_autodetect_method }}"'
+      when: ip_autodetect_check.stdout != ""
+
+    - name: Apply Calico manifest
+      ansible.builtin.command: kubectl apply -f {{ calico_manifest }}
       register: calico_apply
       changed_when: "'created' in calico_apply.stdout or 'configured' in calico_apply.stdout"
 
@@ -220,6 +245,16 @@
       ansible.builtin.command: kubectl -n kube-system rollout status ds/calico-node --timeout=300s
       register: calico_rollout
       changed_when: false
+
+    - name: Verify Calico pods are running
+      ansible.builtin.shell: |
+        kubectl get pods -n kube-system -l k8s-app=calico-node -o wide
+      register: calico_pods
+      changed_when: false
+
+    - name: Display Calico pod status
+      ansible.builtin.debug:
+        var: calico_pods.stdout_lines
 
 # ------------------------------------------------------------------------------------
 
@@ -271,4 +306,12 @@
 
     - name: Display nodes
       ansible.builtin.debug:
-        var: nodes_out.stdout
+        var: nodes_out.stdout_lines
+
+    - name: Show all pods in kube-system
+      ansible.builtin.command: kubectl get pods -n kube-system -o wide
+      register: pods_out
+
+    - name: Display kube-system pods
+      ansible.builtin.debug:
+        var: pods_out.stdout_lines
