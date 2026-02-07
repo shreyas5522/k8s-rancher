@@ -5,7 +5,7 @@ set -euo pipefail
 # Configurable defaults
 # ---------------------------
 DEFAULT_REGION="us-east-2"
-DEFAULT_SSH_CIDR="0.0.0.0/0"   # Consider restricting this to your IP/CIDR
+DEFAULT_SSH_CIDR="0.0.0.0/0"   # Recommend restricting this to your IP
 CP_SG_NAME="k8s-control-plane-sg"
 WK_SG_NAME="k8s-worker-sg"
 
@@ -19,20 +19,28 @@ echo "==============================================" >&2
 # ---------------------------
 # Prompts
 # ---------------------------
-read -rp "Enter AWS Region [${DEFAULT_REGION}]: " REGION
-REGION="${REGION:-$DEFAULT_REGION}"
+# Allow overriding via env vars, otherwise prompt
+if [[ -z "${REGION:-}" ]]; then
+    read -rp "Enter AWS Region [${DEFAULT_REGION}]: " REGION
+    REGION="${REGION:-$DEFAULT_REGION}"
+fi
 
-read -rp "Enter VPC ID (e.g. vpc-xxxxxxxx): " VPC_ID
+if [[ -z "${VPC_ID:-}" ]]; then
+    read -rp "Enter VPC ID (e.g. vpc-xxxxxxxx): " VPC_ID
+fi
+
 if [[ -z "$VPC_ID" ]]; then
-  echo "❌ VPC ID cannot be empty" >&2
+  echo "❌ Error: VPC ID cannot be empty." >&2
   exit 1
 fi
 
-read -rp "Enter SSH allowed CIDR [${DEFAULT_SSH_CIDR}]: " SSH_CIDR
-SSH_CIDR="${SSH_CIDR:-$DEFAULT_SSH_CIDR}"
+if [[ -z "${SSH_CIDR:-}" ]]; then
+    read -rp "Enter SSH allowed CIDR [${DEFAULT_SSH_CIDR}]: " SSH_CIDR
+    SSH_CIDR="${SSH_CIDR:-$DEFAULT_SSH_CIDR}"
+fi
 
 echo "" >&2
-echo "Using:" >&2
+echo "Using Configuration:" >&2
 echo "  Region   : $REGION" >&2
 echo "  VPC ID   : $VPC_ID" >&2
 echo "  SSH CIDR : $SSH_CIDR" >&2
@@ -41,6 +49,7 @@ echo "" >&2
 # ---------------------------
 # Helper functions
 # ---------------------------
+
 get_sg_id_by_name() {
   local name="$1"
   aws ec2 describe-security-groups \
@@ -58,8 +67,8 @@ validate_sg_id() {
 create_sg_if_missing() {
   local name="$1"
   local desc="$2"
-
   local sg_id
+
   sg_id="$(get_sg_id_by_name "$name")"
 
   if [[ -z "$sg_id" || "$sg_id" == "None" ]]; then
@@ -80,33 +89,43 @@ create_sg_if_missing() {
   aws ec2 create-tags --resources "$sg_id" --region "$REGION" \
     --tags "Key=Name,Value=$name" "Key=Description,Value=$desc" >/dev/null 2>&1 || true
 
-  # Echo ONLY the ID to STDOUT so callers can capture it cleanly
+  # Echo ONLY the ID to STDOUT
   echo "$sg_id"
 }
 
-# Adds a single ingress rule; prints status Added/Exists/Error and doesn't hide real errors
+# Adds a single ingress rule
 add_ingress_rule() {
   local sg_id="$1"
   local proto="$2"
-  local port_spec="$3"   # single port or range
-  local src_type="$4"    # "cidr" or "sg"
+  local port_spec="$3"    # single port (80) or range (30000-32767)
+  local src_type="$4"     # "cidr" or "sg"
   local src_val="$5"
 
-  local args=(--group-id "$sg_id" --protocol "$proto" --port "$port_spec" --region "$REGION")
+  # Construct base arguments
+  local args=(--group-id "$sg_id" --protocol "$proto" --region "$REGION")
+
+  # Only add --port if protocol is NOT 'all' or '-1'
+  if [[ "$proto" != "-1" && "$proto" != "all" ]]; then
+      args+=(--port "$port_spec")
+  fi
+
+  # Add source arguments
   if [[ "$src_type" == "cidr" ]]; then
     args+=(--cidr "$src_val")
   else
     args+=(--source-group "$src_val")
   fi
 
+  # Execute and capture output/error
   if output=$(aws ec2 authorize-security-group-ingress "${args[@]}" 2>&1); then
     echo "   ✅ Added: proto=$proto port=$port_spec from $src_type=$src_val" >&2
   else
-    if grep -q "InvalidPermission.Duplicate" <<< "$output"; then
+    # Check for Duplicate error (Idempotency)
+    if echo "$output" | grep -qE "InvalidPermission.Duplicate|InvalidGroup.Duplicate"; then
       echo "   ⚠️  Exists: proto=$proto port=$port_spec from $src_type=$src_val" >&2
     else
       echo "   ❌ Error adding rule: proto=$proto port=$port_spec from $src_type=$src_val" >&2
-      echo "      AWS said: $output" >&2
+      echo "      AWS output: $output" >&2
       exit 1
     fi
   fi
@@ -114,15 +133,15 @@ add_ingress_rule() {
 
 allow_egress_all() {
   local sg_id="$1"
-  # Remove default egress (ignore if absent), then add allow-all
-  aws ec2 revoke-security-group-egress \
-    --group-id "$sg_id" --protocol -1 --cidr 0.0.0.0/0 --region "$REGION" >/dev/null 2>&1 || true
+  # Attempt to revoke default egress if needed (optional, usually not needed if creating fresh)
+  # But we will just ensure Allow All exists.
+  
+  local args=(--group-id "$sg_id" --protocol "-1" --cidr "0.0.0.0/0" --region "$REGION")
 
-  if output=$(aws ec2 authorize-security-group-egress \
-        --group-id "$sg_id" --protocol -1 --cidr 0.0.0.0/0 --region "$REGION" 2>&1); then
+  if output=$(aws ec2 authorize-security-group-egress "${args[@]}" 2>&1); then
     echo "   ✅ Egress: allow all (0.0.0.0/0)" >&2
   else
-    if grep -q "InvalidPermission.Duplicate" <<< "$output"; then
+    if echo "$output" | grep -qE "InvalidPermission.Duplicate"; then
       echo "   ⚠️  Egress already allows all" >&2
     else
       echo "   ❌ Error setting egress: $output" >&2
@@ -132,8 +151,9 @@ allow_egress_all() {
 }
 
 # ---------------------------
-# Create SGs
+# Execution
 # ---------------------------
+
 echo "🚀 Ensuring Security Groups exist..." >&2
 CONTROL_PLANE_SG_ID="$(create_sg_if_missing "$CP_SG_NAME" "$CP_SG_DESC")"
 WORKER_SG_ID="$(create_sg_if_missing "$WK_SG_NAME" "$WK_SG_DESC")"
@@ -148,7 +168,7 @@ if ! validate_sg_id "$WORKER_SG_ID"; then
   exit 1
 fi
 
-# Give AWS a tiny moment to register SGs before adding rules (avoids rare race)
+# Give AWS a moment to propagate existence before adding rules
 sleep 2
 
 # ---------------------------
@@ -157,18 +177,21 @@ sleep 2
 echo "" >&2
 echo "🔐 Configuring INGRESS rules (Control Plane: $CONTROL_PLANE_SG_ID)..." >&2
 
-# Public endpoints (optional; consider restricting in prod)
-add_ingress_rule "$CONTROL_PLANE_SG_ID" tcp 80  cidr "0.0.0.0/0"
-add_ingress_rule "$CONTROL_PLANE_SG_ID" tcp 443 cidr "0.0.0.0/0"
-add_ingress_rule "$CONTROL_PLANE_SG_ID" tcp 22  cidr "$SSH_CIDR"
+# External Access
+add_ingress_rule "$CONTROL_PLANE_SG_ID" tcp 6443 cidr "0.0.0.0/0"     # Kubernetes API (External) - CAREFUL: Limit this in prod!
+add_ingress_rule "$CONTROL_PLANE_SG_ID" tcp 22   cidr "$SSH_CIDR"     # SSH
+add_ingress_rule "$CONTROL_PLANE_SG_ID" tcp 80   cidr "0.0.0.0/0"     # HTTP
+add_ingress_rule "$CONTROL_PLANE_SG_ID" tcp 443  cidr "0.0.0.0/0"     # HTTPS
 
-# Control plane <-> worker and internal
-add_ingress_rule "$CONTROL_PLANE_SG_ID" tcp 6443 sg "$WORKER_SG_ID"            # API server from workers
-add_ingress_rule "$CONTROL_PLANE_SG_ID" tcp 2379-2380 sg "$CONTROL_PLANE_SG_ID" # etcd intra-CP
-add_ingress_rule "$CONTROL_PLANE_SG_ID" tcp 10250 sg "$CONTROL_PLANE_SG_ID"     # kubelet on CP (if used)
-add_ingress_rule "$CONTROL_PLANE_SG_ID" tcp 9345 sg "$WORKER_SG_ID"            # rke2/k3s/cluster comm (if applicable)
-add_ingress_rule "$CONTROL_PLANE_SG_ID" udp 4789 sg "$WORKER_SG_ID"            # VXLAN/Flannel/Cilium overlay
-add_ingress_rule "$CONTROL_PLANE_SG_ID" udp 4789 sg "$CONTROL_PLANE_SG_ID"     # overlay self
+# From Worker Nodes
+add_ingress_rule "$CONTROL_PLANE_SG_ID" tcp 6443 sg "$WORKER_SG_ID"   # API server
+add_ingress_rule "$CONTROL_PLANE_SG_ID" tcp 9345 sg "$WORKER_SG_ID"   # RKE2/Cluster API
+add_ingress_rule "$CONTROL_PLANE_SG_ID" udp 4789 sg "$WORKER_SG_ID"   # VXLAN Overlay
+
+# From Control Plane (Self)
+add_ingress_rule "$CONTROL_PLANE_SG_ID" tcp 2379-2380 sg "$CONTROL_PLANE_SG_ID" # Etcd
+add_ingress_rule "$CONTROL_PLANE_SG_ID" tcp 10250     sg "$CONTROL_PLANE_SG_ID" # Kubelet
+add_ingress_rule "$CONTROL_PLANE_SG_ID" udp 4789      sg "$CONTROL_PLANE_SG_ID" # Overlay Self
 
 # ---------------------------
 # Ingress: Worker
@@ -176,20 +199,22 @@ add_ingress_rule "$CONTROL_PLANE_SG_ID" udp 4789 sg "$CONTROL_PLANE_SG_ID"     #
 echo "" >&2
 echo "🔐 Configuring INGRESS rules (Worker: $WORKER_SG_ID)..." >&2
 
-# NodePort services (node-to-node & pod-to-node)
-add_ingress_rule "$WORKER_SG_ID" tcp 30000-32767 sg "$WORKER_SG_ID"
-add_ingress_rule "$WORKER_SG_ID" udp 30000-32767 sg "$WORKER_SG_ID"
+# NodePorts (External)
+add_ingress_rule "$WORKER_SG_ID" tcp 30000-32767 cidr "0.0.0.0/0"
+add_ingress_rule "$WORKER_SG_ID" udp 30000-32767 cidr "0.0.0.0/0"
 
-# From control plane to worker
-add_ingress_rule "$WORKER_SG_ID" tcp 6443 sg "$CONTROL_PLANE_SG_ID"  # CP -> worker (if needed)
-add_ingress_rule "$WORKER_SG_ID" tcp 22   sg "$CONTROL_PLANE_SG_ID"  # SSH from CP (optional)
-add_ingress_rule "$WORKER_SG_ID" tcp 9345 sg "$CONTROL_PLANE_SG_ID"  # cluster comm (if applicable)
-add_ingress_rule "$WORKER_SG_ID" udp 4789 sg "$CONTROL_PLANE_SG_ID"  # overlay from CP
+# SSH
+add_ingress_rule "$WORKER_SG_ID" tcp 22  cidr "$SSH_CIDR"
 
-# Worker internal
-add_ingress_rule "$WORKER_SG_ID" udp 8472 sg "$WORKER_SG_ID"         # Flannel VXLAN (8472)
-add_ingress_rule "$WORKER_SG_ID" tcp 10250 sg "$WORKER_SG_ID"        # kubelet
-add_ingress_rule "$WORKER_SG_ID" udp 4789  sg "$WORKER_SG_ID"        # overlay self
+# From Control Plane
+add_ingress_rule "$WORKER_SG_ID" tcp 10250 sg "$CONTROL_PLANE_SG_ID" # Kubelet API
+add_ingress_rule "$WORKER_SG_ID" udp 4789  sg "$CONTROL_PLANE_SG_ID" # Overlay
+add_ingress_rule "$WORKER_SG_ID" tcp 9345  sg "$CONTROL_PLANE_SG_ID" # Cluster API
+
+# From Worker (Self)
+add_ingress_rule "$WORKER_SG_ID" tcp 10250 sg "$WORKER_SG_ID"        # Kubelet Self
+add_ingress_rule "$WORKER_SG_ID" udp 4789  sg "$WORKER_SG_ID"        # Overlay Self
+add_ingress_rule "$WORKER_SG_ID" udp 8472  sg "$WORKER_SG_ID"        # Flannel (if used)
 
 # ---------------------------
 # Egress
@@ -207,15 +232,8 @@ echo "✅✅ Kubernetes Security Groups Ready ✅✅" >&2
 echo "----------------------------------------------" >&2
 echo "Region            : $REGION" >&2
 echo "VPC               : $VPC_ID" >&2
-echo "Control Plane SG  : $CONTROL_PLANE_SG_ID  (Name: $CP_SG_NAME)" >&2
-echo "Worker Node SG    : $WORKER_SG_ID         (Name: $WK_SG_NAME)" >&2
+echo "Control Plane SG  : $CONTROL_PLANE_SG_ID" >&2
+echo "Worker Node SG    : $WORKER_SG_ID" >&2
 echo "----------------------------------------------" >&2
-echo "Descriptions & tags are visible in AWS Console UI." >&2
-echo "" >&2
-
-echo "🔎 Current inbound rules (short view):" >&2
-aws ec2 describe-security-groups \
-  --group-ids "$CONTROL_PLANE_SG_ID" "$WORKER_SG_ID" \
-  --region "$REGION" \
-  --query 'SecurityGroups[].{Name:GroupName,Id:GroupId,Ingress:IpPermissions[].{IpProtocol:IpProtocol,From:FromPort,To:ToPort,CIDRs:IpRanges[].CidrIp,SGs:UserIdGroupPairs[].GroupId}}' \
-  --output table
+echo "To view details run:"
+echo "aws ec2 describe-security-groups --group-ids $CONTROL_PLANE_SG_ID $WORKER_SG_ID --region $REGION --output table"
