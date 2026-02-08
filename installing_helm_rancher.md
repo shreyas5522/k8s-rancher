@@ -1,248 +1,331 @@
-Correct ✅ — you’re absolutely right.  
-**Rancher ALWAYS requires cert-manager CRDs**, even if you run Rancher on **HTTP** and **disable ingress/TLS**.  
-That’s why Helm failed with:
 
-    no matches for kind "Issuer" in version "cert-manager.io/v1"
-    ensure CRDs are installed first
+## **🚀 COMPLETE RANCHER INSTALLATION GUIDE**
 
-Below is the **complete, correct, from‑scratch Helm-based installation**, including **cert-manager**, written as a **clean runbook** you can follow line by line.
-
-***
-
-````md
-# Rancher Installation (Helm, HTTP, NodePort)
-
-This installs Rancher on Kubernetes using Helm.
-- HTTP only (no TLS termination)
-- NodePort exposure
-- cert-manager installed (required dependency)
-
----
-
-## Step 1: Verify cluster health
-
+### **Prerequisites Check**
 ```bash
+# Check cluster status
 kubectl get nodes
-kubectl -n kube-system get pods
-````
-
-All nodes must be `Ready`.
-All `calico-node` pods must be `1/1 Running`.
-
-***
-
-## Step 2: Install Helm (if not installed)
-
-```bash
-curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-helm version
+kubectl cluster-info
 ```
 
-***
+### **PHASE 1: PREPARATION**
 
-## Step 3: Install cert-manager (REQUIRED)
+**Step 1.1: Label Control-Plane Node**
+```bash
+kubectl label node ip-10-0-6-214 ingress-ready=true
+```
 
-Rancher requires cert-manager CRDs even when using HTTP.
-
-### Add cert-manager Helm repo
-
+**Step 1.2: Add Helm Repositories**
 ```bash
 helm repo add jetstack https://charts.jetstack.io
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo add rancher-latest https://releases.rancher.com/server-charts/latest
 helm repo update
 ```
 
-### Install cert-manager CRDs
+### **PHASE 2: CERT-MANAGER INSTALLATION**
 
+**Step 2.1: Install cert-manager**
 ```bash
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.crds.yaml
-```
-
-### Install cert-manager via Helm
-
-```bash
+kubectl create namespace cert-manager
 helm install cert-manager jetstack/cert-manager \
   --namespace cert-manager \
   --create-namespace \
-  --version v1.14.4
+  --version v1.14.5 \
+  --set installCRDs=true
 ```
 
-### Verify cert-manager
-
+**Step 2.2: Wait for cert-manager**
 ```bash
+sleep 30
+kubectl -n cert-manager wait --for=condition=Ready pods --all --timeout=300s
 kubectl -n cert-manager get pods
 ```
 
-All pods must be `Running`:
+### **PHASE 3: NGINX INGRESS INSTALLATION**
 
-*   cert-manager
-*   cert-manager-webhook
-*   cert-manager-cainjector
-
-***
-
-## Step 4: Add Rancher Helm repo
-
+**Step 3.1: Create NGINX values file**
 ```bash
-helm repo add rancher-latest https://releases.rancher.com/server-charts/latest
-helm repo update
-helm search repo rancher-latest/rancher
+cat <<EOF > nginx-values.yaml
+controller:
+  hostNetwork: true
+  kind: Deployment
+  service:
+    type: ClusterIP
+    enabled: false
+  hostPort:
+    enabled: true
+  nodeSelector:
+    ingress-ready: "true"
+  tolerations:
+  - key: "node-role.kubernetes.io/control-plane"
+    effect: "NoSchedule"
+    operator: "Exists"
+EOF
 ```
 
-***
-
-## Step 5: Create Rancher namespace
-
+**Step 3.2: Install NGINX**
 ```bash
-kubectl create namespace cattle-system || true
+kubectl create namespace ingress-nginx
+helm install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx \
+  --create-namespace \
+  -f nginx-values.yaml
 ```
 
-***
-
-## Step 6: Install Rancher (HTTP, NodePort)
-
+**Step 3.3: Verify NGINX**
 ```bash
+kubectl -n ingress-nginx get pods -o wide
+kubectl -n ingress-nginx get deployment
+```
+
+### **PHASE 4: NETWORK CONFIGURATION**
+
+**Step 4.1: Fix rp_filter on Control-Plane**
+```bash
+# Check current value
+cat /proc/sys/net/ipv4/conf/all/rp_filter
+
+# Fix it
+sudo sysctl -w net.ipv4.conf.all.rp_filter=2
+echo "net.ipv4.conf.all.rp_filter=2" | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+
+# Verify
+cat /proc/sys/net/ipv4/conf/all/rp_filter
+```
+
+### **PHASE 5: COREDNS CONFIGURATION**
+
+**Step 5.1: Get Control-Plane IP**
+```bash
+CONTROL_PLANE_IP=$(kubectl get node ip-10-0-6-214 -o jsonpath='{.status.addresses[0].address}')
+echo "Control Plane IP: $CONTROL_PLANE_IP"
+```
+
+**Step 5.2: Update CoreDNS**
+```bash
+# Backup current config
+kubectl -n kube-system get configmap coredns -o yaml > coredns-backup.yaml
+
+# Update CoreDNS with the host entry
+kubectl -n kube-system get configmap coredns -o yaml | \
+  sed "/forward \. \/etc\/resolv.conf {/i\        hosts {\n          $CONTROL_PLANE_IP rancher.shreyash.cloud\n          fallthrough\n        }" | \
+  kubectl apply -f -
+
+# Restart CoreDNS
+kubectl -n kube-system rollout restart deployment coredns
+kubectl -n kube-system wait --for=condition=Ready pod -l k8s-app=kube-dns --timeout=120s
+```
+
+### **PHASE 6: RANCHER INSTALLATION**
+
+**Step 6.1: Install Rancher with CORRECT ingress class**
+```bash
+kubectl create namespace cattle-system
 helm install rancher rancher-latest/rancher \
   --namespace cattle-system \
-  --set hostname=3.150.231.167 \
+  --create-namespace \
+  --set hostname=rancher.shreyash.cloud \
+  --set bootstrapPassword=admin \
   --set replicas=1 \
-  --set ingress.enabled=false \
-  --set service.type=NodePort \
-  --set service.nodePort=30080
+  --set ingress.ingressClassName=nginx \
+  --set ingress.tls.source=rancher
 ```
 
-What this does:
-
-*   Installs Rancher server
-*   Disables ingress
-*   Exposes Rancher via NodePort 30080
-*   Uses cert-manager internally (no TLS termination)
-
-***
-
-## Step 7: Watch Rancher start
-
+**Step 6.2: Wait for Rancher**
 ```bash
-kubectl -n cattle-system get pods -w
+sleep 30
+kubectl -n cattle-system wait --for=condition=Ready pods -l app=rancher --timeout=300s
+kubectl -n cattle-system get pods
 ```
 
-Wait until:
+### **PHASE 7: LET'S ENCRYPT CERTIFICATE SETUP**
 
-    rancher-xxxxx   1/1   Running
-
-Check service:
-
+**Step 7.1: Create ClusterIssuer (REPLACE EMAIL!)**
 ```bash
-kubectl -n cattle-system get svc rancher
+# Replace admin@shreyash.cloud with YOUR email
+cat <<EOF | kubectl apply -f -
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@shreyash.cloud  # ⚠️ CHANGE THIS TO YOUR REAL EMAIL!
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+    - http01:
+        ingress:
+          class: nginx
+EOF
 ```
 
-Expected:
-
-    NodePort: 30080/TCP
-
-***
-
-## Step 8: Access Rancher UI
-
-Open in browser:
-
-    http://3.150.231.167:30080
-
-Make sure the EC2 Security Group allows:
-
-*   TCP 30080 from your IP (or 0.0.0.0/0 for testing)
-
-***
-
-## Step 9 (Optional): Use port 8080 instead of 30080
-
-Kubernetes NodePort cannot directly bind to 8080.
-Use iptables on the node with public IP 3.150.231.167.
-
+**Step 7.2: Create Certificate**
 ```bash
-sudo iptables -t nat -A PREROUTING -p tcp --dport 8080 -j REDIRECT --to-port 30080
-sudo iptables -t nat -A OUTPUT -p tcp --dport 8080 -j REDIRECT --to-port 30080
+cat <<EOF | kubectl apply -f -
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: rancher-tls
+  namespace: cattle-system
+spec:
+  secretName: rancher-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  commonName: rancher.shreyash.cloud
+  dnsNames:
+  - rancher.shreyash.cloud
+EOF
 ```
 
-Now access Rancher at:
-
-    http://3.150.231.167:8080
-
-***
-
-## Step 10: Get Rancher bootstrap password
-
+**Step 7.3: Monitor Certificate**
 ```bash
-kubectl -n cattle-system exec \
-  "$(kubectl -n cattle-system get pods -l app=rancher -o jsonpath='{.items[0].metadata.name}')" \
-  -- cat /var/lib/rancher/management-state/bootstrap-secret
+# Watch certificate status
+kubectl -n cattle-system get certificate -w
+
+# In another terminal, watch challenges
+kubectl -n cattle-system get challenge -w
 ```
 
-***
+### **PHASE 8: NGINX CERTIFICATE CONFIGURATION**
 
-## Step 11: Login to Rancher
-
-URL:
-
-    http://3.150.231.167:30080
-    # or
-    http://3.150.231.167:8080
-
-Login:
-
-*   Username: admin
-*   Password: (bootstrap secret)
-
-Set a new password when prompted.
-
-***
-
-## Cleanup (if needed)
-
+**Step 8.1: Configure NGINX to use Let's Encrypt certificate**
 ```bash
-helm uninstall rancher -n cattle-system
-helm uninstall cert-manager -n cert-manager
-kubectl delete namespace cattle-system cert-manager
+kubectl -n ingress-nginx patch configmap ingress-nginx-controller --type=merge \
+  -p '{"data":{"default-ssl-certificate":"cattle-system/rancher-tls"}}'
 ```
 
-***
-
-## Notes
-
-*   cert-manager is mandatory for Rancher
-*   HTTP mode is supported but NOT secure
-*   This setup is ideal for labs / PoC
-*   For production, use HTTPS + Ingress
-
-***
-
-## URLs Summary
-
-*   Rancher UI (NodePort):
-    <http://3.150.231.167:30080>
-
-*   Rancher UI (mapped):
-    <http://3.150.231.167:8080>
-
+**Step 8.2: Restart NGINX**
+```bash
+kubectl -n ingress-nginx rollout restart deployment ingress-nginx-controller
+kubectl -n ingress-nginx wait --for=condition=Ready pods --all --timeout=180s
 ```
 
----
+### **PHASE 9: DNS & CLOUDFLARE CONFIGURATION**
 
-### ✅ Why this will work now
+**Step 9.1: Get Public IP**
+```bash
+PUBLIC_IP=$(curl -s http://checkip.amazonaws.com)
+echo "Your Public IP: $PUBLIC_IP"
+```
 
-- cert-manager CRDs installed ✅
-- cert-manager pods running ✅
-- Rancher Helm chart dependencies satisfied ✅
-- No ingress/TLS conflicts ✅
-- Calico already healthy ✅
+**Step 9.2: Set DNS Record**
+```
+Go to your DNS provider (Cloudflare) and create:
+Type: A
+Name: rancher
+Content: 3.21.57.173 (or your current public IP)
+TTL: Auto
+Proxy: ON (orange cloud)
+```
 
----
+**Step 9.3: Configure Cloudflare SSL**
+```
+1. Go to Cloudflare Dashboard
+2. Select your domain
+3. SSL/TLS → Overview
+4. Set SSL/TLS encryption mode to: FULL or FULL (STRICT)
+   NOT FLEXIBLE!
+```
 
-If you want next:
-- HTTPS with cert-manager
-- Rancher behind Ingress
-- HA Rancher (3 replicas)
-- Persist iptables rules
-- Import downstream clusters
+### **PHASE 10: VERIFICATION**
 
-Just tell me what to do next 👍
+**Step 10.1: Check All Components**
+```bash
+echo "=== POD STATUS ==="
+kubectl get pods -n cattle-system -n ingress-nginx -n cert-manager
+
+echo -e "\n=== CERTIFICATE STATUS ==="
+kubectl -n cattle-system get certificate,secret | grep tls
+
+echo -e "\n=== INGRESS STATUS ==="
+kubectl -n cattle-system get ingress rancher -o yaml | grep -A5 "spec:"
+
+echo -e "\n=== NGINX CONFIG ==="
+kubectl -n ingress-nginx describe configmap ingress-nginx-controller | grep -i "default-ssl-certificate"
+```
+
+**Step 10.2: Test Internal Access**
+```bash
+kubectl run -it --rm test-curl --image=curlimages/curl --restart=Never -- \
+  curl -v -H "Host: rancher.shreyash.cloud" http://ingress-nginx-controller.ingress-nginx.svc.cluster.local 2>&1 | grep -E "HTTP|Location" | head -5
+```
+
+**Step 10.3: Test External Access (after DNS)**
+```bash
+# Wait 2-5 minutes after DNS change, then:
+curl -v https://rancher.shreyash.cloud
+
+# Or test directly with IP
+curl -k -H "Host: rancher.shreyash.cloud" https://3.21.57.173
+```
+
+### **PHASE 11: TROUBLESHOOTING COMMANDS**
+
+**If certificate stuck:**
+```bash
+# Check details
+kubectl -n cattle-system describe certificate rancher-tls
+kubectl -n cattle-system describe challenge
+
+# Check cert-manager logs
+kubectl -n cert-manager logs deployment/cert-manager -f
+
+# Check NGINX logs
+kubectl -n ingress-nginx logs deployment/ingress-nginx-controller -f
+
+# Force renewal
+kubectl -n cattle-system annotate certificate rancher-tls cert-manager.io/renew=true --overwrite
+```
+
+**If 404 error persists:**
+```bash
+# Check ingress class
+kubectl -n cattle-system get ingress rancher -o jsonpath='{.spec.ingressClassName}'
+
+# If missing, fix it:
+kubectl -n cattle-system patch ingress rancher --type=merge -p '{"spec":{"ingressClassName":"nginx"}}'
+
+# Restart NGINX
+kubectl -n ingress-nginx rollout restart deployment ingress-nginx-controller
+```
+
+### **PHASE 12: ACCESS INFORMATION**
+
+**Step 12.1: Get Bootstrap Password**
+```bash
+BOOTSTRAP_PASSWORD=$(kubectl -n cattle-system get secret bootstrap-secret -o go-template='{{.data.bootstrapPassword|base64decode}}' 2>/dev/null || echo "admin")
+echo "Bootstrap Password: $BOOTSTRAP_PASSWORD"
+```
+
+**Step 12.2: Display Access Info**
+```bash
+echo ""
+echo "========================================="
+echo "🎉 RANCHER INSTALLATION COMPLETE!"
+echo "========================================="
+echo ""
+echo "1. DNS CONFIGURATION:"
+echo "   rancher.shreyash.cloud → 3.21.57.173"
+echo ""
+echo "2. CLOUDFLARE SETTINGS:"
+echo "   SSL/TLS: FULL or FULL (STRICT)"
+echo "   NOT FLEXIBLE!"
+echo ""
+echo "3. ACCESS RANCHER:"
+echo "   URL: https://rancher.shreyash.cloud"
+echo "   Username: admin"
+echo "   Password: $BOOTSTRAP_PASSWORD"
+echo ""
+echo "4. DIRECT LOGIN URL:"
+echo "   https://rancher.shreyash.cloud/dashboard/?setup=$BOOTSTRAP_PASSWORD"
+echo ""
+echo "5. MONITORING:"
+echo "   Certificate: kubectl -n cattle-system get certificate -w"
+echo "   Logs: kubectl -n ingress-nginx logs deployment/ingress-nginx-controller -f"
+echo "========================================="
 ```
