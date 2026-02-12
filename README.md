@@ -138,7 +138,7 @@ workers
 ***
 
 
-## **Part 1 — Preparing Nodes for K8S **
+## **Part 1 — Preparing Nodes for K8S**
 
 
 ### **Phase 0 — Initial Setup (SSH Key, Ansible, Calico Networking)**
