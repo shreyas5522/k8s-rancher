@@ -1,4 +1,4 @@
-# 📘 **Kubernetes + Rancher Cluster Architecture (AWS Deployment)**
+# **Kubernetes + Rancher Cluster Architecture (AWS Deployment)**
 
 ### **EC2 Instances: Control‑Plane (Public Subnet) + 3 Worker Nodes (Private Subnets)**
 
